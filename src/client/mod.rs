@@ -2,12 +2,13 @@
 //! holds all the logic.
 
 mod core;
+mod resolve;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -22,6 +23,7 @@ use runtime_streams::Stream;
 
 use self::core::ClientCore;
 pub use self::core::QueryError;
+pub use self::resolve::{IpVersion, ResolveError};
 use crate::protocol::{Layout, Message, Name, Query, Question, RecordType};
 
 /// Standard DNS port, for both UDP and TCP.
@@ -139,6 +141,14 @@ impl<S: BufRingSpec> DnsClient<S> {
 
     pub fn server(&self) -> SocketAddr {
         self.shared.core.borrow().server()
+    }
+
+    /// An address of the `version` asked for `name`: the first one the
+    /// server gives, after following CNAMEs. Any response without one is an
+    /// error, including a truncated one.
+    pub async fn resolve(&self, name: Name, version: IpVersion) -> Result<IpAddr, ResolveError> {
+        let response = self.query(name, version.record_type()).await?;
+        resolve::first_address(&response.message(), version)
     }
 
     /// Sends a recursive query. It advertises EDNS with a UDP payload size
@@ -382,6 +392,22 @@ mod tests {
 
     fn name(s: &str) -> Name {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn resolves_a_name_to_an_address() {
+        let server = fake_server(|s| {
+            let (query, from) = recv_query(&s);
+            s.send_to(&answer(&query, [192, 0, 2, 7]), from).unwrap();
+        });
+        runtime::main_thread_with::<TestRing, _>(async {
+            let client = DnsClient::<TestRing>::new(server).unwrap();
+            let addr = client
+                .resolve(name("api.test"), IpVersion::V4)
+                .await
+                .unwrap();
+            assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+        });
     }
 
     #[test]
