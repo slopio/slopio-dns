@@ -2,10 +2,12 @@
 //! clock. The I/O layer feeds it events (queries, datagrams, send errors) and
 //! carries out what it asks for (datagrams to send, queries to wake).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+
+use rustc_hash::FxHashMap;
 
 use crate::protocol::{Layout, Message, Query};
 
@@ -102,7 +104,7 @@ impl<D> Entry<D> {
 /// `UdpDatagram` in the client, plain bytes in tests.
 pub(super) struct ClientCore<D> {
     server: SocketAddr,
-    queries: HashMap<u16, Entry<D>>,
+    queries: FxHashMap<u16, Entry<D>>,
     /// IDs waiting to be sent, in submission order. May hold IDs cancelled
     /// since; they're skipped.
     outbox: VecDeque<u16>,
@@ -116,7 +118,7 @@ impl<D: AsRef<[u8]>> ClientCore<D> {
     pub(super) fn new(server: SocketAddr) -> Self {
         Self {
             server,
-            queries: HashMap::new(),
+            queries: FxHashMap::default(),
             outbox: VecDeque::new(),
             case_randomization: true,
         }

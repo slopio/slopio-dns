@@ -7,3 +7,4 @@ edition = "2024"
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 rand = "0.8"
+rustc-hash = "2"

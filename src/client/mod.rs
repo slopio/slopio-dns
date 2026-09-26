@@ -5,7 +5,6 @@ mod core;
 mod resolve;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -20,6 +19,7 @@ use runtime::runtime::time::timeout;
 use runtime::task::Handle;
 use runtime::{BufRingSpec, spawn};
 use runtime_streams::Stream;
+use rustc_hash::FxHashMap;
 
 use self::core::ClientCore;
 pub use self::core::QueryError;
@@ -75,7 +75,7 @@ impl<S: BufRingSpec> AsRef<[u8]> for Payload<S> {
 struct Shared<S: BufRingSpec> {
     core: RefCell<ClientCore<Payload<S>>>,
     /// Queries waiting for their outcome, by ID.
-    waiters: RefCell<HashMap<u16, Waker>>,
+    waiters: RefCell<FxHashMap<u16, Waker>>,
     task_waker: Cell<Option<Waker>>,
     closed: Cell<bool>,
 }
