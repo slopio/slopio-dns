@@ -19,10 +19,9 @@ use runtime::runtime::time::timeout;
 use runtime::task::Handle;
 use runtime::{BufRingSpec, spawn};
 use runtime_streams::Stream;
-use rustc_hash::FxHashMap;
 
-use self::core::ClientCore;
 pub use self::core::QueryError;
+use self::core::{ClientCore, Settled};
 pub use self::resolve::{IpVersion, ResolveError};
 use crate::protocol::{Layout, Message, Name, Query, Question, RecordType};
 
@@ -73,9 +72,7 @@ impl<S: BufRingSpec> AsRef<[u8]> for Payload<S> {
 
 /// What the queries and the client task share.
 struct Shared<S: BufRingSpec> {
-    core: RefCell<ClientCore<Payload<S>>>,
-    /// Queries waiting for their outcome, by ID.
-    waiters: RefCell<FxHashMap<u16, Waker>>,
+    core: RefCell<ClientCore<Payload<S>, Waker>>,
     task_waker: Cell<Option<Waker>>,
     closed: Cell<bool>,
 }
@@ -104,7 +101,6 @@ impl<S: BufRingSpec> DnsClient<S> {
         let (recv, send) = UdpSocket::bind_addr(local)?.into_split();
         let shared = Rc::new(Shared {
             core: RefCell::new(ClientCore::new(server)),
-            waiters: RefCell::default(),
             task_waker: Cell::new(None),
             closed: Cell::new(false),
         });
@@ -203,22 +199,20 @@ impl<S: BufRingSpec> Shared<S> {
         id: u16,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(UdpDatagram<S>, Layout), QueryError>> {
-        let outcome = self.core.borrow_mut().take_result(id);
+        let outcome = self
+            .core
+            .borrow_mut()
+            .poll_outcome(id, |waiter| match waiter {
+                Some(waker) if waker.will_wake(cx.waker()) => {}
+                _ => *waiter = Some(cx.waker().clone()),
+            });
         if let Some(outcome) = outcome {
             return Poll::Ready(outcome.map(|(Payload(datagram), layout)| (datagram, layout)));
         }
         if self.closed.get() {
             return Poll::Ready(Err(QueryError::Closed));
         }
-        self.waiters.borrow_mut().insert(id, cx.waker().clone());
         Poll::Pending
-    }
-
-    fn wake_query(&self, id: u16) {
-        let waker = self.waiters.borrow_mut().remove(&id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
     }
 
     fn wake_task(&self) {
@@ -229,8 +223,16 @@ impl<S: BufRingSpec> Shared<S> {
 
     fn close(&self) {
         self.closed.set(true);
-        let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
-        waiters.into_values().for_each(Waker::wake);
+        // Collected first: waking runs outside the borrow.
+        let waiters: Vec<_> = self.core.borrow_mut().take_waiters().collect();
+        waiters.into_iter().for_each(Waker::wake);
+    }
+}
+
+/// Wakes the query that just settled, if it's waiting.
+fn wake(settled: Option<Settled<Waker>>) {
+    if let Some(waker) = settled.and_then(|settled| settled.waiter) {
+        waker.wake();
     }
 }
 
@@ -277,9 +279,7 @@ impl<S: BufRingSpec> Task<S> {
             free_bufs.push(buf);
             if let Err(error) = result {
                 let settled = shared.core.borrow_mut().on_send_error(*id, error);
-                if settled {
-                    shared.wake_query(*id);
-                }
+                wake(settled);
             }
             false
         });
@@ -305,19 +305,17 @@ impl<S: BufRingSpec> Task<S> {
             return;
         }
         let from = datagram.addr();
-        let answered = self
+        let settled = self
             .shared
             .core
             .borrow_mut()
             .on_datagram(from, Payload(datagram));
-        if let Some(id) = answered {
-            self.shared.wake_query(id);
-        }
+        wake(settled);
     }
 }
 
 /// Forgets a query however it ends, including by timeout or drop,
-/// releasing any buffer it still holds.
+/// releasing any buffer and waker it still holds.
 struct Registration<'a, S: BufRingSpec> {
     shared: &'a Shared<S>,
     id: u16,
@@ -326,7 +324,6 @@ struct Registration<'a, S: BufRingSpec> {
 impl<S: BufRingSpec> Drop for Registration<'_, S> {
     fn drop(&mut self) {
         self.shared.core.borrow_mut().cancel(self.id);
-        self.shared.waiters.borrow_mut().remove(&self.id);
     }
 }
 

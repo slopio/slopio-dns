@@ -1,8 +1,10 @@
-//! The client's logic as a state machine, with no I/O: no socket, no waker, no
-//! clock. The I/O layer feeds it events (queries, datagrams, send errors) and
-//! carries out what it asks for (datagrams to send, queries to wake).
+//! The client's logic as a state machine, with no I/O: no socket, no clock.
+//! The I/O layer feeds it events (queries, datagrams, send errors) and carries
+//! out what it asks for (datagrams to send, waiters to wake). Each query keeps
+//! its waiter, opaque to the core: a `Waker` in the client, anything in tests.
 
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -75,14 +77,23 @@ impl<D> QueryState<D> {
     }
 }
 
-struct Entry<D> {
+struct InFlight<D, W> {
     query: Query<'static>,
     /// Sent with 0x20 encoding: the response must echo the case exactly.
     exact_case: bool,
     state: QueryState<D>,
+    /// To wake once the query settles, if it registered.
+    waiter: Option<W>,
 }
 
-impl<D> Entry<D> {
+/// A query that just settled, and its waiter to wake, if it registered one.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Settled<W> {
+    pub(super) id: u16,
+    pub(super) waiter: Option<W>,
+}
+
+impl<D, W> InFlight<D, W> {
     /// Runs a transition. Returns whether it applied; if rejected, the state
     /// is left as it was.
     fn apply(
@@ -98,13 +109,27 @@ impl<D> Entry<D> {
         self.state = state;
         applied
     }
+
+    /// Settles the query with `transition`, handing back its waiter; `None`
+    /// if the transition was rejected.
+    fn settle_with(
+        &mut self,
+        id: u16,
+        transition: impl FnOnce(QueryState<D>) -> Result<QueryState<D>, QueryState<D>>,
+    ) -> Option<Settled<W>> {
+        self.apply(transition).then(|| Settled {
+            id,
+            waiter: self.waiter.take(),
+        })
+    }
 }
 
 /// Every query in flight against one server. `D` is a received datagram:
-/// `UdpDatagram` in the client, plain bytes in tests.
-pub(super) struct ClientCore<D> {
+/// `UdpDatagram` in the client, plain bytes in tests. `W` is what to wake
+/// when a query settles.
+pub(super) struct ClientCore<D, W> {
     server: SocketAddr,
-    queries: FxHashMap<u16, Entry<D>>,
+    queries: FxHashMap<u16, InFlight<D, W>>,
     /// IDs waiting to be sent, in submission order. May hold IDs cancelled
     /// since; they're skipped.
     outbox: VecDeque<u16>,
@@ -113,7 +138,7 @@ pub(super) struct ClientCore<D> {
     case_randomization: bool,
 }
 
-impl<D: AsRef<[u8]>> ClientCore<D> {
+impl<D: AsRef<[u8]>, W> ClientCore<D, W> {
     /// A core with 0x20 encoding on.
     pub(super) fn new(server: SocketAddr) -> Self {
         Self {
@@ -155,10 +180,11 @@ impl<D: AsRef<[u8]>> ClientCore<D> {
         }
         self.queries.insert(
             id,
-            Entry {
+            InFlight {
                 query,
                 exact_case: self.case_randomization,
                 state: QueryState::Queued,
+                waiter: None,
             },
         );
         self.outbox.push_back(id);
@@ -187,9 +213,9 @@ impl<D: AsRef<[u8]>> ClientCore<D> {
         None
     }
 
-    /// Settles the query `datagram` answers, returning its ID. Anything that
-    /// answers nothing in flight is dropped.
-    pub(super) fn on_datagram(&mut self, from: SocketAddr, datagram: D) -> Option<u16> {
+    /// Settles the query `datagram` answers. Anything that answers nothing in
+    /// flight is dropped.
+    pub(super) fn on_datagram(&mut self, from: SocketAddr, datagram: D) -> Option<Settled<W>> {
         let id = transaction_id(datagram.as_ref())?;
         let entry = self.queries.get_mut(&id)?;
         let layout = answer_layout(
@@ -199,23 +225,38 @@ impl<D: AsRef<[u8]>> ClientCore<D> {
             from,
             datagram.as_ref(),
         )?;
-        entry.apply(|s| s.answer(datagram, layout)).then_some(id)
+        entry.settle_with(id, |s| s.answer(datagram, layout))
     }
 
-    /// Settles a query whose send failed. Returns whether it changed state.
-    pub(super) fn on_send_error(&mut self, id: u16, error: io::Error) -> bool {
+    /// Settles a query whose send failed.
+    pub(super) fn on_send_error(&mut self, id: u16, error: io::Error) -> Option<Settled<W>> {
         self.queries
-            .get_mut(&id)
-            .is_some_and(|entry| entry.apply(|s| s.fail(error)))
+            .get_mut(&id)?
+            .settle_with(id, |s| s.fail(error))
     }
 
-    /// Takes a settled query's outcome, which also forgets the query.
-    pub(super) fn take_result(&mut self, id: u16) -> Option<Result<(D, Layout), QueryError>> {
-        let entry = self.queries.get(&id)?;
-        if !entry.state.is_settled() {
+    /// Takes a settled query's outcome, which also forgets the query. If it
+    /// hasn't settled, `register` sets (or keeps) the waiter to wake once it does.
+    pub(super) fn poll_outcome(
+        &mut self,
+        id: u16,
+        register: impl FnOnce(&mut Option<W>),
+    ) -> Option<Result<(D, Layout), QueryError>> {
+        let Entry::Occupied(mut query) = self.queries.entry(id) else {
+            return None;
+        };
+        if !query.get().state.is_settled() {
+            register(&mut query.get_mut().waiter);
             return None;
         }
-        self.queries.remove(&id)?.state.settle().ok()
+        query.remove().state.settle().ok()
+    }
+
+    /// Takes every registered waiter, to wake them all when the client stops.
+    pub(super) fn take_waiters(&mut self) -> impl Iterator<Item = W> + '_ {
+        self.queries
+            .values_mut()
+            .filter_map(|query| query.waiter.take())
     }
 }
 
@@ -313,12 +354,21 @@ mod tests {
         response
     }
 
-    fn core() -> ClientCore<Vec<u8>> {
+    fn core() -> ClientCore<Vec<u8>, u32> {
         ClientCore::new(SERVER)
     }
 
+    /// The ID of the query `datagram` settles, if any.
+    fn answered(
+        core: &mut ClientCore<Vec<u8>, u32>,
+        from: SocketAddr,
+        datagram: Vec<u8>,
+    ) -> Option<u16> {
+        core.on_datagram(from, datagram).map(|settled| settled.id)
+    }
+
     /// Submits and sends one query, returning its ID and wire form.
-    fn sent(core: &mut ClientCore<Vec<u8>>, name: &str) -> (u16, Vec<u8>) {
+    fn sent(core: &mut ClientCore<Vec<u8>, u32>, name: &str) -> (u16, Vec<u8>) {
         let id = core.submit(query(name)).unwrap();
         let mut wire = Vec::new();
         assert_eq!(core.poll_transmit(&mut wire), Some(id));
@@ -329,17 +379,20 @@ mod tests {
     fn a_query_goes_queued_sent_answered() {
         let mut core = core();
         let id = core.submit(query("example.com")).unwrap();
-        assert!(core.take_result(id).is_none(), "queued: nothing yet");
+        assert!(
+            core.poll_outcome(id, |_| {}).is_none(),
+            "queued: nothing yet"
+        );
 
         let mut wire = Vec::new();
         assert_eq!(core.poll_transmit(&mut wire), Some(id));
         assert_eq!(&wire[..2], id.to_be_bytes(), "sent under its ID");
         assert_eq!(core.poll_transmit(&mut wire), None, "sent only once");
-        assert!(core.take_result(id).is_none(), "sent: nothing yet");
+        assert!(core.poll_outcome(id, |_| {}).is_none(), "sent: nothing yet");
 
         let response = respond(&wire);
-        assert_eq!(core.on_datagram(SERVER, response.clone()), Some(id));
-        assert_eq!(core.take_result(id).unwrap().unwrap().0, response);
+        assert_eq!(answered(&mut core, SERVER, response.clone()), Some(id));
+        assert_eq!(core.poll_outcome(id, |_| {}).unwrap().unwrap().0, response);
         assert!(core.is_empty(), "taking the result forgets the query");
     }
 
@@ -361,37 +414,37 @@ mod tests {
         let response = respond(&wire);
 
         assert_eq!(
-            core.on_datagram(STRANGER, response.clone()),
+            answered(&mut core, STRANGER, response.clone()),
             None,
             "wrong sender"
         );
 
         let mut other_id = response.clone();
         other_id[0] ^= 0xFF;
-        assert_eq!(core.on_datagram(SERVER, other_id), None, "unknown ID");
+        assert_eq!(answered(&mut core, SERVER, other_id), None, "unknown ID");
 
         let mut wrong_question = response.clone();
         wrong_question[14] = b'z';
         assert_eq!(
-            core.on_datagram(SERVER, wrong_question),
+            answered(&mut core, SERVER, wrong_question),
             None,
             "wrong question"
         );
 
         assert_eq!(
-            core.on_datagram(SERVER, wire.clone()),
+            answered(&mut core, SERVER, wire.clone()),
             None,
             "not a response"
         );
         assert_eq!(
-            core.on_datagram(SERVER, response[..20].to_vec()),
+            answered(&mut core, SERVER, response[..20].to_vec()),
             None,
             "malformed"
         );
-        assert_eq!(core.on_datagram(SERVER, vec![]), None, "empty");
+        assert_eq!(answered(&mut core, SERVER, vec![]), None, "empty");
 
-        assert!(core.take_result(id).is_none(), "still waiting");
-        assert_eq!(core.on_datagram(SERVER, response), Some(id));
+        assert!(core.poll_outcome(id, |_| {}).is_none(), "still waiting");
+        assert_eq!(answered(&mut core, SERVER, response), Some(id));
     }
 
     /// The question's name in `wire`, as sent.
@@ -418,8 +471,8 @@ mod tests {
         let (id, wire) = sent(&mut core, "example.com");
         let mut recased = respond(&wire);
         recased[13] ^= 0x20; // the first letter's case
-        assert_eq!(core.on_datagram(SERVER, recased), None);
-        assert_eq!(core.on_datagram(SERVER, respond(&wire)), Some(id));
+        assert_eq!(answered(&mut core, SERVER, recased), None);
+        assert_eq!(answered(&mut core, SERVER, respond(&wire)), Some(id));
     }
 
     #[test]
@@ -431,7 +484,7 @@ mod tests {
 
         let mut lowered = respond(&wire);
         lowered[13..24].make_ascii_lowercase(); // length bytes are below 'A'
-        assert_eq!(core.on_datagram(SERVER, lowered), Some(id));
+        assert_eq!(answered(&mut core, SERVER, lowered), Some(id));
     }
 
     #[test]
@@ -441,16 +494,69 @@ mod tests {
         core.set_case_randomization(false);
         let mut recased = respond(&wire);
         recased[13] ^= 0x20;
-        assert_eq!(core.on_datagram(SERVER, recased), None, "still exact");
-        assert_eq!(core.on_datagram(SERVER, respond(&wire)), Some(id));
+        assert_eq!(answered(&mut core, SERVER, recased), None, "still exact");
+        assert_eq!(answered(&mut core, SERVER, respond(&wire)), Some(id));
+    }
+
+    #[test]
+    fn hands_back_the_waiter_when_a_query_settles() {
+        let mut core = core();
+        let (id, wire) = sent(&mut core, "example.com");
+        assert!(core.poll_outcome(id, |w| *w = Some(7)).is_none());
+        let settled = core.on_datagram(SERVER, respond(&wire));
+        assert_eq!(
+            settled,
+            Some(Settled {
+                id,
+                waiter: Some(7)
+            })
+        );
+
+        let (id, _) = sent(&mut core, "failed.test");
+        assert!(core.poll_outcome(id, |w| *w = Some(8)).is_none());
+        let settled = core.on_send_error(id, io::Error::other("unreachable"));
+        assert_eq!(
+            settled,
+            Some(Settled {
+                id,
+                waiter: Some(8)
+            })
+        );
+    }
+
+    #[test]
+    fn cancelling_drops_the_waiter_with_the_query() {
+        let mut core = core();
+        let (id, wire) = sent(&mut core, "example.com");
+        core.poll_outcome(id, |w| *w = Some(7));
+        core.cancel(id);
+        assert_eq!(core.take_waiters().count(), 0);
+        assert_eq!(core.on_datagram(SERVER, respond(&wire)), None);
+    }
+
+    #[test]
+    fn takes_every_waiter_on_close() {
+        let mut core = core();
+        for (waiter, name) in [(1, "a.test"), (2, "b.test")] {
+            let (id, _) = sent(&mut core, name);
+            core.poll_outcome(id, |w| *w = Some(waiter));
+        }
+        let mut waiters: Vec<_> = core.take_waiters().collect();
+        waiters.sort();
+        assert_eq!(waiters, [1, 2]);
+        assert_eq!(core.take_waiters().count(), 0, "taken once");
     }
 
     #[test]
     fn takes_only_the_first_response() {
         let mut core = core();
         let (id, wire) = sent(&mut core, "example.com");
-        assert_eq!(core.on_datagram(SERVER, respond(&wire)), Some(id));
-        assert_eq!(core.on_datagram(SERVER, respond(&wire)), None, "duplicate");
+        assert_eq!(answered(&mut core, SERVER, respond(&wire)), Some(id));
+        assert_eq!(
+            answered(&mut core, SERVER, respond(&wire)),
+            None,
+            "duplicate"
+        );
     }
 
     #[test]
@@ -463,7 +569,7 @@ mod tests {
         let mut expected = Vec::new();
         query("example.com").encode(&mut expected);
         expected[..2].copy_from_slice(&id.to_be_bytes());
-        assert_eq!(core.on_datagram(SERVER, respond(&expected)), None);
+        assert_eq!(answered(&mut core, SERVER, respond(&expected)), None);
     }
 
     #[test]
@@ -475,7 +581,7 @@ mod tests {
 
         let (id, wire) = sent(&mut core, "late.test");
         core.cancel(id);
-        assert_eq!(core.on_datagram(SERVER, respond(&wire)), None);
+        assert_eq!(answered(&mut core, SERVER, respond(&wire)), None);
         assert!(core.is_empty());
     }
 
@@ -483,17 +589,23 @@ mod tests {
     fn a_failed_send_settles_the_query() {
         let mut core = core();
         let (id, _) = sent(&mut core, "example.com");
-        assert!(core.on_send_error(id, io::Error::other("unreachable")));
-        assert!(matches!(core.take_result(id), Some(Err(QueryError::Io(_)))));
+        assert!(
+            core.on_send_error(id, io::Error::other("unreachable"))
+                .is_some()
+        );
+        assert!(matches!(
+            core.poll_outcome(id, |_| {}),
+            Some(Err(QueryError::Io(_)))
+        ));
     }
 
     #[test]
     fn a_send_error_cannot_fail_a_settled_query() {
         let mut core = core();
         let (id, wire) = sent(&mut core, "example.com");
-        core.on_datagram(SERVER, respond(&wire));
-        assert!(!core.on_send_error(id, io::Error::other("late")));
-        assert!(core.take_result(id).unwrap().is_ok());
+        answered(&mut core, SERVER, respond(&wire));
+        assert!(core.on_send_error(id, io::Error::other("late")).is_none());
+        assert!(core.poll_outcome(id, |_| {}).unwrap().is_ok());
     }
 
     #[test]
