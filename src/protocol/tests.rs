@@ -242,26 +242,26 @@ fn response_matching() {
     assert!(!Message::parse(&other).unwrap().is_response_to(&query));
 }
 
-runtime::define_buf_ring!(Ring, bgid = 0, buffer_size = 4096, ring_size = 4);
-runtime::define_buf_ring!(TinyRing, bgid = 1, buffer_size = 128, ring_size = 4);
+slopio::define_buf_ring!(Ring, bgid = 0, buffer_size = 4096, ring_size = 4);
+slopio::define_buf_ring!(TinyRing, bgid = 1, buffer_size = 128, ring_size = 4);
 
 /// Sends `payload` to a multishot receiver on `port` and hands over the datagram.
-async fn receive<S: runtime::BufRingSpec>(
+async fn receive<S: slopio::BufRingSpec>(
     port: u16,
     payload: &[u8],
-) -> runtime::io_driver::operations::sockets::udp::UdpDatagram<S> {
-    use runtime_streams::StreamExt;
+) -> slopio::io_driver::operations::sockets::udp::UdpDatagram<S> {
+    use slopio::streams::StreamExt;
 
-    let socket = runtime::net::UdpSocket::bind_addr((Ipv4Addr::LOCALHOST, port).into()).unwrap();
+    let socket = slopio::net::UdpSocket::bind_addr((Ipv4Addr::LOCALHOST, port).into()).unwrap();
     let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     peer.send_to(payload, (Ipv4Addr::LOCALHOST, port)).unwrap();
-    let mut stream = runtime::net::UdpMultiRecv::<S>::new(socket);
+    let mut stream = slopio::net::UdpMultiRecv::<S>::new(socket);
     stream.next().await.unwrap().unwrap()
 }
 
 #[test]
 fn parses_from_datagram() {
-    runtime::main_thread_with::<(Ring, TinyRing), _>(async {
+    slopio::main_thread_with::<(Ring, TinyRing), _>(async {
         let buf = response(&[(1, &[93, 184, 215, 14])]);
         let datagram = receive::<Ring>(19501, &buf).await;
         let msg = Message::from_datagram(&datagram).unwrap();

@@ -1,6 +1,6 @@
 # popple-dns
 
-A DNS client over UDP for the io_uring [`runtime`](https://github.com/saucisoupe/runtime):
+A DNS client over UDP for the io_uring [`slopio`](https://crates.io/crates/slopio):
 resolves a name to an IPv4 or IPv6 address, with many queries in flight on one socket,
 no allocations in the protocol, and protection against forged responses.
 

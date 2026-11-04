@@ -1,7 +1,7 @@
 use std::fmt;
 
-use runtime::BufRingSpec;
-use runtime::io_driver::operations::sockets::udp::UdpDatagram;
+use slopio::BufRingSpec;
+use slopio::io_driver::operations::sockets::udp::UdpDatagram;
 
 use super::header::HEADER_LEN;
 use super::record::Entry;

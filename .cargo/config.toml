@@ -1,3 +1,0 @@
-[net]
-# Use the system git (and its SSH key) to fetch private git dependencies.
-git-fetch-with-cli = true

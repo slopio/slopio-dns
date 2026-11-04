@@ -13,12 +13,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use runtime::io_driver::operations::sockets::udp::{UdpDatagram, UdpSendTo};
-use runtime::net::{UdpMultiRecv, UdpRecvHalf, UdpSendHalf, UdpSocket};
-use runtime::runtime::time::timeout;
-use runtime::task::Handle;
-use runtime::{BufRingSpec, spawn};
-use runtime_streams::Stream;
+use slopio::io_driver::operations::sockets::udp::{UdpDatagram, UdpSendTo};
+use slopio::net::{UdpMultiRecv, UdpRecvHalf, UdpSendHalf, UdpSocket};
+use slopio::runtime::time::timeout;
+use slopio::streams::Stream;
+use slopio::task::Handle;
+use slopio::{BufRingSpec, spawn};
 
 pub use self::core::QueryError;
 use self::core::{ClientCore, Settled};
@@ -343,13 +343,13 @@ impl<S: BufRingSpec> Response<S> {
 mod tests {
     use std::net::UdpSocket as StdUdpSocket;
 
-    use runtime::runtime::join::join;
-    use runtime::runtime::select::{SelectResult, select};
+    use slopio::runtime::join::join;
+    use slopio::runtime::select::{SelectResult, select};
 
     use super::*;
     use crate::protocol::RData;
 
-    runtime::define_buf_ring!(TestRing, bgid = 2, buffer_size = 2048, ring_size = 16);
+    slopio::define_buf_ring!(TestRing, bgid = 2, buffer_size = 2048, ring_size = 16);
 
     /// Runs `script` on a thread with a blocking socket, standing in for the server.
     fn fake_server(script: impl FnOnce(StdUdpSocket) + Send + 'static) -> SocketAddr {
@@ -397,7 +397,7 @@ mod tests {
             let (query, from) = recv_query(&s);
             s.send_to(&answer(&query, [192, 0, 2, 7]), from).unwrap();
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server).unwrap();
             let addr = client
                 .resolve(name("api.test"), IpVersion::V4)
@@ -413,7 +413,7 @@ mod tests {
             let (query, from) = recv_query(&s);
             s.send_to(&answer(&query, [192, 0, 2, 1]), from).unwrap();
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server).unwrap();
             let response = client
                 .query(name("example.com"), RecordType::A)
@@ -438,7 +438,7 @@ mod tests {
                 s.send_to(&answer(&query, ip), from).unwrap();
             }
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server).unwrap();
             let (a, b) = join(
                 client.query(name("a.test"), RecordType::A),
@@ -463,7 +463,7 @@ mod tests {
             s.send_to(&wrong, from).unwrap();
             s.send_to(&answer(&query, [192, 0, 2, 1]), from).unwrap();
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server).unwrap();
             let response = client
                 .query(name("example.com"), RecordType::A)
@@ -480,7 +480,7 @@ mod tests {
             let (query, from) = recv_query(&s);
             s.send_to(&answer(&query, [192, 0, 2, 1]), from).unwrap();
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server)
                 .unwrap()
                 .with_timeout(Duration::from_millis(100));
@@ -506,7 +506,7 @@ mod tests {
             let (query, from) = recv_query(&s);
             s.send_to(&answer(&query, [192, 0, 2, 1]), from).unwrap();
         });
-        runtime::main_thread_with::<TestRing, _>(async {
+        slopio::main_thread_with::<TestRing, _>(async {
             let client = DnsClient::<TestRing>::new(server)
                 .unwrap()
                 .with_timeout(Duration::from_millis(500));
