@@ -1,7 +1,17 @@
 [package]
-name = "popple-dns"
+name = "slopio-dns"
 version = "0.1.0"
 edition = "2024"
+description = "A DNS client over UDP for the io_uring runtime slopio, with many queries in flight on one socket"
+license = "MIT"
+repository = "https://github.com/slopio/slopio-dns"
+readme = "README.md"
+keywords = ["dns", "resolver", "io-uring", "async", "udp"]
+categories = ["network-programming", "asynchronous"]
+exclude = [".github/"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 slopio = "0.1"

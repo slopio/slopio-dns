@@ -1,4 +1,4 @@
-# popple-dns
+# slopio-dns
 
 A DNS client over UDP for the io_uring [`slopio`](https://crates.io/crates/slopio):
 resolves a name to an IPv4 or IPv6 address, with many queries in flight on one socket,

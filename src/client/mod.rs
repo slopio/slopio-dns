@@ -1,4 +1,4 @@
-//! The DNS client: a task doing the I/O around [`core::ClientCore`], which
+//! The DNS client: a task doing the I/O around a sans-I/O core, which
 //! holds all the logic.
 
 mod core;
@@ -40,7 +40,7 @@ const SEND_BUF_CAPACITY: usize = 512;
 /// A DNS client that sends queries to a single upstream server over UDP.
 ///
 /// The socket lives in a dedicated task. Queries only register with the
-/// [`ClientCore`] and wake the task; each time the task wakes, whether for new
+/// client core and wake the task; each time the task wakes, whether for new
 /// queries, finished sends or received datagrams, it sends everything queued
 /// and settles the queries their responses answer. Any number of queries can
 /// be in flight at once.
